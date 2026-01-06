@@ -1,0 +1,206 @@
+---
+title: "Model Fit"
+author: "Giacomo Scampini, Alessio Benzonelli"
+output: html_document
+---
+
+```{r}
+library(truncnorm)
+library(MASS)
+source("R/ordinal_probit_sampler.R")
+
+data <- read.csv("data/processed/wine_reduced.csv")
+str(data)
+```
+
+# Algorithm
+
+Having defined the ordinal probit model, we now describe the MCMC scheme used for posterior inference. A straightforward Gibbs sampler would update each cutpoint $\gamma_c$ from its full conditional, which is uniform on an interval determined by adjacent latent values, $\gamma_c \mid z,y \sim \mathrm{Unif}(\max_{y_i=c} z_i,\ \min_{y_i=c+1} z_i)$. When there are many observations in neighbouring categories, these intervals can become very narrow, producing very small updates of $\gamma$ and therefore slow mixing. To mitigate this issue, we adopt a hybrid Metropolis--Hastings/Gibbs strategy: at each iteration we update the cutpoints $\gamma$ with a Metropolis--Hastings step conditional on $(y,\beta)$, and then sample the latent variables $z$ and the regression coefficients $\beta$ from their conjugate full conditionals. This data-augmentation approach targets the correct posterior while typically improving mixing for the cutpoints.
+
+# Metropolis--Hastings/Gibbs 
+
+At iteration $k$, the sampler proceeds as follows. First, propose a new vector of cutpoints $g$ from a truncated normal random-walk proposal that respects the ordering constraints (with fixed endpoints $g_0=-\infty$, $g_1=0$, and $g_C=+\infty$), and accept the proposal with probability $\min(1,R)$, where $R$ is the Metropolis--Hastings ratio given by a likelihood ratio times a proposal-density ratio. Second, sample each latent variable independently from its full conditional, $z_i^{(k)} \sim \mathcal{TN}(x_i^\top \beta^{(k-1)}, 1;\ \gamma_{y_i-1}^{(k)}, \gamma_{y_i}^{(k)})$, i.e., a normal distribution with mean $x_i^\top \beta^{(k-1)}$ and variance $1$, truncated to the interval $(\gamma_{y_i-1}^{(k)}, \gamma_{y_i}^{(k)}]$. Finally, sample $\beta$ from its multivariate normal full conditional given $z^{(k)}$ and $X$ (under a flat prior, $\beta^{(k)} \sim \mathcal{N}((X^\top X)^{-1}X^\top z^{(k)},\ (X^\top X)^{-1})$). In practice, the proposal scale $\sigma_{\mathrm{MH}}$ is tuned to obtain a reasonable acceptance rate, the first iterations are discarded as burn-in, and convergence is assessed using standard MCMC diagnostics.
+
+# Data preprocessing
+
+```{r}
+# Keep only quality levels 3..8
+filtered_data <- subset(data, quality %in% 3:8)
+
+# Response: re-index to 0..5
+y <- filtered_data$quality - 3
+
+# Predictors: everything except quality
+X_raw <- as.matrix(subset(filtered_data, select = -quality))
+
+# Standardize predictors and add intercept
+X <- cbind(Intercept = 1, scale(X_raw))
+
+head(X)
+table(y)
+```
+In this section we prepare the data for the ordinal probit model. Since the observed quality ratings in our dataset range from 3 to 8, we work with these six ordered categories and (as a safety check) keep only observations with quality in this range. For implementation convenience, we then recode the response as $y=\text{quality}-3$, so that $y \in {0,\ldots,5}$; this is only a re-labeling of the same ordered outcomes and it simplifies the indexing of cutpoints in the sampler. Next, we construct the predictor matrix $X$ from all remaining variables (excluding quality), standardize the predictors to have mean zero and unit variance to place them on a comparable scale and improve MCMC efficiency, and finally add an intercept column to the design matrix.
+
+```{r include=FALSE}
+# Initialization
+init_beta <- rep(0, ncol(X))
+
+C <- length(unique(y))  # should be 6 if y=0..5
+init_gamma <- c(-Inf, 0, seq(1, C-2, length.out = C-2), Inf)
+
+# Priors
+beta_prior_mean <- rep(0, ncol(X))
+beta_prior_cov  <- diag(10, ncol(X))
+```
+
+```{r}
+results <- gibbs_mh(
+  y = y, X = X,
+  init_beta = init_beta, init_gamma = init_gamma,
+  n_iter = 30000,
+  beta_prior_mean = beta_prior_mean,
+  beta_prior_cov  = beta_prior_cov,
+  sigma_gamma = 0.05
+)
+```
+
+```{r}
+beta_samples  <- results$beta
+gamma_samples <- results$gamma
+```
+
+```{r}
+colnames(beta_samples) <- colnames(X)
+colnames(gamma_samples) <- paste0("gamma_", 0:(ncol(gamma_samples)-1))
+
+dir.create("outputs/fits", recursive = TRUE, showWarnings = FALSE)
+saveRDS(results, "outputs/fits/ordinal_probit_mcmc.rds")
+```
+
+# Summary of the beta samples
+```{r}
+post_mean <- colMeans(beta_samples)
+post_mean
+```
+Each coefficient $\beta_j$ quantifies the association between predictor $x_j$ and the latent utility $Z$ in the ordinal probit model, holding the other predictors constant. Because predictors were standardized, $\beta_j$ represents the change in $Z$ associated with a one standard-deviation increase in $x_j$. Positive coefficients shift $Z$ upward, increasing the probability of crossing higher cutpoints (higher quality categories), whereas negative coefficients shift $Z$ downward, increasing the probability of lower quality categories.
+
+In our posterior summaries, alcohol has the largest positive effect (posterior mean $\approx 0.529$), followed by sulphates (posterior mean $\approx 0.264$). This suggests that wines with higher alcohol content and higher sulphate levels tend to have higher latent scores and are therefore more likely to be assigned to higher quality categories. Conversely, volatile.acidity shows a clear negative association (posterior mean $\approx -0.347$), indicating that higher volatile acidity decreases the latent score and shifts probability mass toward lower quality ratings. The remaining predictors (citric.acid, residual.sugar, chlorides, total.sulfur.dioxide, and pH) have posterior means closer to zero (in absolute value), suggesting weaker effects in this specification.
+
+Finally, the intercept (posterior mean $\approx 3.03$) sets the baseline location of the latent scale given the chosen cutpoint anchoring; because it is strongly confounded with the cutpoints, it is treated primarily as a nuisance parameter rather than a quantity of direct substantive interest.
+
+# Graphical Analysis
+
+```{r echo=FALSE, fig.width=12, fig.height=9, fig.cap="Figure 3: Trace plots of sampled beta coefficients"}
+p <- ncol(beta_samples)
+
+par(mfrow = c(3, 4),
+    mar = c(3.6, 3.6, 3.2, 1.0),  # bigger top margin
+    cex.axis = 0.8,
+    cex.lab  = 0.9)
+
+for (j in 1:p) {
+  plot(beta_samples[, j], type = "l",
+       xlab = "Iteration", ylab = "", main = "")
+  mtext(colnames(beta_samples)[j], side = 3, line = 1.2, cex = 0.9)  # clear title
+}
+
+par(mfrow = c(1, 1))
+
+```
+```{r echo=FALSE, fig.width=12, fig.height=9, fig.cap="Figure 4: Autocorrelation functions (ACF) of sampled beta coefficients"}
+p <- ncol(beta_samples)
+
+par(mfrow = c(3, 4),
+    mar = c(3.6, 3.6, 3.2, 1.0),  # bigger top margin
+    cex.axis = 0.8,
+    cex.lab  = 0.9)
+
+for (j in 1:p) {
+  acf(beta_samples[, j], xlab = "Lag", main = "", cex.main = 1)
+  mtext(colnames(beta_samples)[j], side = 3, line = 1.2, cex = 0.9)  # clear title
+}
+
+par(mfrow = c(1, 1))
+```
+
+```{r echo=FALSE, fig.cap="Figure 5: Trace and ACF for one coefficient after burn-in and thinning"}
+burn_in <- 2000
+thin <- 10
+j <- 1  # choose which beta to inspect (e.g., 1 = Intercept)
+
+idx <- seq(burn_in + 1, nrow(beta_samples), by = thin)
+beta_post <- beta_samples[idx, j]
+
+par(mfrow = c(1, 2), mar = c(4.5, 4.2, 2, 1))
+plot(beta_post, type = "l", xlab = "Stored draw", ylab = colnames(beta_samples)[j])
+acf(beta_post, xlab = "Lag", main = colnames(beta_samples)[j])
+par(mfrow = c(1, 1))
+```
+Figure~3 reports trace plots for the sampled regression coefficients $\beta$, while Figure~4 shows the corresponding autocorrelation functions (ACF). For most slope coefficients, the traces fluctuate around stable levels and the ACF decreases reasonably quickly, indicating satisfactory mixing. In contrast, the intercept typically displays noticeably higher autocorrelation, reflecting stronger dependence between successive draws; this behaviour is expected in ordinal probit models because the intercept is strongly confounded with the cutpoints that determine the location of the latent scale. In Figure~5 we illustrate the effect of discarding an initial burn-in and applying thinning for a selected coefficient. Thinning does not alter the underlying Markov chain or improve its mixing, but it can reduce autocorrelation among the stored draws and make trace/ACF diagnostics easier to read.
+
+# Convergence diagnostic
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(coda)
+
+burn_in <- 4000
+
+beta_post <- beta_samples[(burn_in + 1):nrow(beta_samples), , drop = FALSE]
+
+mcmc_post <- mcmc(beta_post)
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+g <- geweke.diag(mcmc_post)$z
+g <- sort(g)
+
+# Print z-scores
+g
+
+# Flag coefficients with |z| > 1.96 (rough 5% rule of thumb)
+problem <- names(g)[abs(g) > 1.96]
+problem
+```
+The Geweke diagnostic compares the mean of an early segment of the chain with the mean of a late segment. Values of the Geweke $z$-score close to $0$ suggest no strong evidence against convergence, while large absolute values (as a rule of thumb, $|z|>1.96$) indicate that the early and late parts of the chain differ, which may reflect slow mixing or remaining non-stationarity. After increasing the burn-in to 4,000 iterations, none of the coefficients exceed this threshold, so the Geweke test provides no strong evidence of non-convergence for the post–burn-in draws.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+raftery.diag(mcmc_post)
+```
+The Raftery–Lewis diagnostic estimates the number of iterations required to estimate a specified quantile with a given accuracy, and it reports a dependence factor that reflects autocorrelation in the chain. For the slope coefficients, the required total iterations are around $4{,}100$-$4{,}400$ with dependence factors close to 1, indicating satisfactory mixing. In contrast, the intercept shows a much larger dependence factor (about $52.5$) and a substantially larger required chain length, reflecting strong autocorrelation. This behaviour is common in ordinal probit models because the intercept is strongly confounded with the cutpoints that determine the location of the latent scale. Since the substantive conclusions focus on the slope coefficients and predictive performance, we proceed with the post-burn-in samples and treat the intercept primarily as a nuisance parameter.
+
+# Posterior predictive check
+
+```{r include=FALSE}
+library(bayesplot)
+library(ggplot2)
+
+# load PPC helpers
+source("R/posterior_predictive.R")   # <-- whatever you named that script
+
+# observed y on original scale (3..8)
+y_or <- y + 3
+
+# use a subset of posterior draws for PPC (faster + standard)
+S <- 300
+draw_ids <- round(seq(1, nrow(beta_samples), length.out = S))
+
+# simulate replicated datasets from posterior predictive
+yrep <- simulate_yrep(
+  X = X,
+  beta_samples = beta_samples,
+  gamma_samples = gamma_samples,
+  include_noise = TRUE,
+  draw_ids = draw_ids
+)
+
+# back to original scale
+yrep_or <- yrep + 3
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.cap="Figure 6: PPC bars (category proportions)"}
+ppc_bars(y_or, yrep_or[1:100, ]) 
+```
+The posterior predictive check in Figure~X compares the observed category proportions (points) with the model-implied proportions under replicated datasets drawn from the posterior predictive distribution (line with 95% uncertainty bands). Overall, the observed proportions lie close to the predictive bands across the quality levels, indicating that the model is able to reproduce the main shape of the empirical distribution. The fact that several observed points fall near the edges of the bands suggests small but systematic discrepancies in a few categories; in particular, the predictive intervals tend to sit slightly above the observed proportions, which is consistent with a mild tendency of the model to over-allocate probability mass to those categories. Nonetheless, since the observed proportions remain largely within the posterior predictive uncertainty, the fit appears adequate for describing the marginal distribution of wine quality in this restricted range (3–8).
+

@@ -1,0 +1,20 @@
+.Rhistory
+.RData
+.Rproj.user/
+.RDS
+*.rds
+
+# rendered outputs
+*.html
+*.pdf
+*.docx
+_cache/
+_files/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# renv (optional)
+renv/library/
+renv/python/

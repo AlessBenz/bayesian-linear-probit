@@ -1,0 +1,112 @@
+---
+title: "Introduction, EDA and Probit explanation"
+author: "Giacomo Scampini, Alessio Benzonelli"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+data <- read.csv("../data/raw/vino_qualita.csv")
+```
+
+# Introduction
+
+The dataset contains red and white variants of the Portuguese wine Vinho Verde. It was downloaded from Kaggle (https://www.kaggle.com/datasets/uciml/red-wine-quality-cortez-et-al-2009) (Wine Quality - Cortez et al., 2009), and it originates from the study by Cortez et al. (2009).
+To protect privacy and for practical reasons, the available data include only physicochemical measurements and the associated sensory quality score.
+The aim of this project is to assess whether these measurements help explain wine quality, which is the response variable. We adopt a Bayesian regression framework: wine quality is modeled probabilistically, and uncertainty about the regression parameters is summarized by their posterior distribution rather than by a single point estimate. This allows us to quantify uncertainty in the effects of the predictors and to evaluate the model using posterior predictive checks. 
+
+```{r echo=FALSE}
+summary(data)
+```
+The eleven regressors presented in $Figure\ 1$ are as follows:
+
+- 'fixed.acidity': the total concentration of acids present in a solution encompasses both organic and inorganic acids.
+- 'volatile.acidity': the concentration of volatile acids, predominantly acetic acid, in a solution.  
+- 'residual.sugar': the quantity of residual sugar present in the final wine following the conclusion of fermentation.
+- 'chlorides': the concentration of chloride ions present in the wine. 
+- 'free.sulfur.dioxide': the portion of sulfur dioxide that is not bound to other compounds in the wine. 
+- 'total.sulfur.dioxide': the combined concentration of both free and bound sulfur dioxide present in the wine. 
+- 'density': this term is used to describe the mass of wine per unit volume.
+- 'pH': a measure of the acidity or alkalinity of a solution. 
+- 'citric.acid': the presence of the organic acid in the wine  
+- 'alcohol': the percentage of alcohol in the wine.
+- 'sulphates': sulfur-based compounds, commonly employed in the production of wine and other food and beverage products as preservatives.
+
+# EDA
+
+```{r echo=FALSE, fig.width=10, fig.height=8, fig.cap="Figure 1: regressors'histogram"}
+
+data_long <- data %>%
+  pivot_longer(cols = -quality, names_to = "variable", values_to = "value")
+
+ggplot(data_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Predictor distributions") +
+  theme_minimal()
+
+```
+
+The response variable, designated as 'quality', is a numerical variable with a range of values from zero to ten. As illustrated in $Figure\ 2$ The majority of the observations exhibited a quality value of five or six. The majority of wines are of an average quality, with only a small proportion exhibiting either poor or excellent characteristics.
+
+```{r echo=FALSE, fig.cap="Figure 2: Distribution of wine quality ratings"}
+ggplot(data, aes(x = factor(quality))) +
+  geom_bar(fill = "maroon") +
+  labs(x = "Quality (rating)", y = "Count") +
+  theme_minimal()
+```
+
+# Correlation Analysis
+
+```{r}
+num <- data %>% select(-quality)
+cor_mat <- cor(num)
+
+cor_df <- as.data.frame(as.table(cor_mat))
+names(cor_df) <- c("Var1", "Var2", "Correlation")
+
+ggplot(cor_df, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile() +
+  coord_equal() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation between predictors", x = NULL, y = NULL)
+
+```
+
+```{r}
+X <- subset(data, select = -quality)
+R <- cor(X, method = "spearman", use = "pairwise.complete.obs")
+R[lower.tri(R, diag = TRUE)] <- NA
+
+top_pairs <- as.data.frame(as.table(R))
+names(top_pairs) <- c("var1","var2","r")
+
+top_pairs <- top_pairs[!is.na(top_pairs$r), ]
+top_pairs <- top_pairs[order(-abs(top_pairs$r)), ]
+head(top_pairs, 15)
+
+```
+
+Pairwise Spearman correlations among the predictors reveal a few clear clusters. The strongest association is between free.sulfur.dioxide and total.sulfur.dioxide ($\rho \approx 0.79$), indicating substantial redundancy between these measures. A second cluster involves acidity-related variables: fixed.acidity is strongly negatively correlated with pH ($\rho \approx -0.71$) and positively correlated with citric.acid ($\rho \approx 0.66$), while citric.acid is also negatively correlated with pH ($\rho \approx -0.55$) and volatile.acidity ($\rho \approx -0.61$). Finally, density shows moderate correlations with alcohol ($\rho \approx -0.46$) and with measures of dissolved solids such as residual.sugar ($\rho \approx 0.42$) and chlorides ($\rho \approx 0.41$), suggesting that it partly summarizes variation captured by these variables.
+
+# Subset selection based on correlation
+
+To reduce multicollinearity and improve interpretability, we remove predictors that are near-duplicates of others. In particular, we retain total.sulfur.dioxide and drop free.sulfur.dioxide given their strong correlation. Because fixed.acidity and pH convey closely related information about acidity, we keep pH as a compact descriptor and exclude fixed.acidity. Additionally, since density is moderately correlated with both alcohol and residual.sugar, we prefer to model these components directly and omit density in the reduced specification. The remaining predictors are kept because their pairwise associations are at most moderate, and they plausibly capture distinct aspects of wine composition relevant to quality.
+
+```{r}
+drop_vars <- c("free.sulfur.dioxide", "fixed.acidity", "density")
+data_reduced <- data[, !names(data) %in% drop_vars]
+
+
+# quick check
+names(data_reduced)
+```
+
+# The Ordinal Probit
+
+In a probit model the response is linked to a linear predictor through the standard normal CDF. In the binary case, with $Y_i \in {0,1}$, we assume $Y_i\mid\pi_i \sim \mathrm{Bern}(\pi_i)$ and $\pi_i=\Phi(x_i^\top\beta)$, where $\Phi(\cdot)$ is the standard normal CDF. To extend this idea to ordinal ratings, we introduce a continuous latent variable $z_i$ such that $z_i = x_i^\top\beta + \varepsilon_i$ with $\varepsilon_i \sim \mathcal{N}(0,1)$, and we obtain the observed grade by thresholding $z_i$ with ordered cutpoints $-\infty=\gamma_0<\gamma_1<\cdots<\gamma_{C-1}<\gamma_C=+\infty$: specifically, $y_i=c$ if and only if $\gamma_{c-1}<z_i\le \gamma_c$. This implies category probabilities of the form $\Pr(y_i=c\mid x_i,\beta,\gamma)=\Phi(\gamma_c-x_i^\top\beta)-\Phi(\gamma_{c-1}-x_i^\top\beta)$, and equivalently cumulative probabilities $\Pr(y_i\le c\mid x_i,\beta,\gamma)=\Phi(\gamma_c-x_i^\top\beta)$. Introducing the latent variables ${z_i}$ is particularly convenient in a Bayesian setting because it leads to an efficient data-augmentation MCMC scheme, where we alternate sampling $z$, the regression coefficients $\beta$, and the cutpoints $\gamma$.
